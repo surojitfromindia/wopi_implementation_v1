@@ -18,14 +18,6 @@ function AuthMiddleware(req, res, next) {
 }
 
 
-//  each wopi router must start with /wopi
-const router = Router();
-
-router.use(AuthMiddleware);
-router.get('/files/:file_id/contents', WOPIFileController.GetFile);
-router.get('/files/:file_id', WOPIFileController.CheckFileInfo);
-
-
 // /files/(file_id) -> CheckFileInfo
 
 class WOPIFileController {
@@ -53,13 +45,34 @@ class WOPIFileController {
         const headers = req.headers;
         const file_id = req.params["file_id"];
         const wopi_file_service = new WOPIFileService({user_id: req.user_id});
-        const {} =await wopi_file_service.overrideFile(file_id, headers);
+        const {} = await wopi_file_service.overrideFile(file_id, headers);
+    }
 
-
+    static async OverrideFile(req, res) {
+        const headers = req.headers;
+        const file_id = req.params["file_id"];
+        const file_buffer = req.body;
+        const wopi_file_service = new WOPIFileService({user_id: req.user_id});
+        const {
+            response_headers,
+            http_status_code
+        } = await wopi_file_service.overrideFile(file_id, headers, file_buffer);
+        res.status(http_status_code)
+        for (let key in response_headers) {
+            res.setHeader(key, response_headers[key]);
+        }
+        res.send();
     }
 }
 
 
+//  each wopi router must start with /wopi
+const router = Router();
+
+router.use(AuthMiddleware);
+router.get('/files/:file_id/contents', WOPIFileController.GetFile);
+router.get('/files/:file_id', WOPIFileController.CheckFileInfo);
+router.post('/files/:file_id', WOPIFileController.OverrideFile);
 
 
 class WOPIFileService {
@@ -107,7 +120,7 @@ class WOPIFileService {
 
     async GetFile(file_id) {
         const file_storage = new FileManager(new DeviceFileStorage());
-        const file_buffer =await file_storage.loadFile(file_id);
+        const file_buffer = await file_storage.loadFile(file_id);
         const file_meta = await file_storage.getFileMetadata(file_id);
         return {
             file_buffer,
@@ -116,64 +129,106 @@ class WOPIFileService {
 
     }
 
-    async overrideFile(file_id, headers) {
+    async overrideFile(file_id, headers, file_buffer) {
         const x_wopi_override = headers['X-WOPI-Override'];
-        const x_wopi_lock = headers['X-WOPI-Lock'];
+        const x_wopi_lock_id = headers['X-WOPI-Lock'];
         // support LOCK, FOR NOW.
         let http_status_code = 200;
         let response_headers = {}
 
         //  check if the file is locked
-        const db_lock_status = await this.#getLockStatus(file_id, x_wopi_lock);
-        const is_locked = db_lock_status.is_locked;
+        const db_lock_status = await this.#getLockStatus(file_id, x_wopi_lock_id);
+        const is_locked = db_lock_status.is_locked; // is file locked?
+        const db_lock_id = db_lock_status.lock_id; // current lock id in db
 
-        if(is_locked){
+        /** this file isn't locked */
 
-        }
+        if (x_wopi_override === "GET_LOCK") {
+            // if file is locked then return the lock id
+            if (is_locked) {
+                // the file is locked
+                response_headers = {
+                    "X-WOPI-Lock": db_lock_id,
+                }
+            }
+            // if not lock then return empty lock id
+            else {
+                // the file is unlocked
+                response_headers = {
+                    "X-WOPI-Lock": "",
+                }
+            }
+        } else if (x_wopi_override === "REFRESH_LOCK") {
+            if (!is_locked) {
+                // file is not locked so, return empty lock id
+                response_headers = {
+                    "X-WOPI-Lock": "",
+                }
+            }
+            if (is_locked && db_lock_id !== x_wopi_lock_id) {
+                // the file is locked but the lock id is different
+                // return the lock id
+                response_headers = {
+                    "X-WOPI-Lock": db_lock_id,
+                }
+                http_status_code = 409;
+            } else {
+                // else, refresh the lock
+                await this.RefreshLock(file_id, x_wopi_lock_id);
+            }
+        } else if (x_wopi_override === "LOCK") {
+            // if the file is locked and the lock id is different -
+            // return 409 conflict
+            if (is_locked && db_lock_id !== x_wopi_lock_id) {
+                http_status_code = 409;
+                headers = {
+                    "X-WOPI-Lock": db_lock_id,
+                }
+            }
+            if (is_locked && db_lock_id === x_wopi_lock_id) {
+                // refresh the lock
+                await this.RefreshLock(file_id, x_wopi_lock_id);
+            } else {
+                // lock the file
+                await this.Lock(file_id, x_wopi_lock_id);
+            }
+        } else if (x_wopi_override === "UNLOCK") {
 
-        switch (x_wopi_override) {
-            case "LOCK":{
-                const {has_failed} = await this.Lock(file_id, x_wopi_lock);
+            // if the file is locked and the lock id is different from what is in db
+            // and is in header, return conflict 409
+            if (is_locked && db_lock_id !== x_wopi_lock_id) {
+                http_status_code = 409;
+                response_headers = {
+                    "X-WOPI-Lock": db_lock_id,
+                }
+            } else if (is_locked && db_lock_id === x_wopi_lock_id) {
+                // unlock the file
+                await this.Unlock(file_id);
+            }
+        } else if (x_wopi_override === "PUT") {
+            // if the file is locked and the lock id is different from what is in db
+            // and is in header, return conflict 409
+            if (is_locked && db_lock_id !== x_wopi_lock_id) {
+                http_status_code = 409;
+                response_headers = {
+                    "X-WOPI-Lock": db_lock_id,
+                }
+            } else if (is_locked && db_lock_id === x_wopi_lock_id) {
+                // put the file
+                await this.putFile(file_id, file_buffer);
             }
         }
-
 
 
         return {
             response_headers,
             http_status_code,
-            file: null,
         }
     }
 
 
     async Lock(file_id, lock_id) {
-        let http_status_code = 200;
-        let failure_reason = null;
-        let has_failed = false;
 
-        const db_lock_status = await this.#getLockStatus(file_id);
-        if(db_lock_status===null){
-            // can lock this file
-            // insert lock status in db
-        }
-        else if (db_lock_status.lock_id===lock_id){
-            // already locked by this lock_id
-            // extend lock by RefreshLock
-           await this.RefreshLock(file_id, lock_id);
-        }
-        else {
-            // the file is already locked by another lock_id
-            // return 409 conflict
-            http_status_code = 409;
-            failure_reason = "File is already locked by another user";
-            has_failed = true;
-        }
-        return {
-            http_status_code,
-            failure_reason,
-            has_failed
-        }
     }
 
     async RefreshLock(file_id, lock_id) {
@@ -189,11 +244,9 @@ class WOPIFileService {
     }
 
     async #getLockStatus(file_id, lock_id) {
-        // todo: get lock status from db
-        // 1. if lock is expired, return { is_locked: false }
-        // 2. if given lock_id matches with the lock_id in db, return { is_locked: false }
+
         return {
-            lock_id : "some random lock id",
+            lock_id: "some random lock id",
             is_locked: true,
         }
     }
