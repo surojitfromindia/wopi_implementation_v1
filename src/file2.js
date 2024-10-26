@@ -1,11 +1,16 @@
 const {WopiActions } =require("./WopiDiscovery");
 
 (async ()=>{
-    const wopi = new WopiActions();
-    const m = await wopi.getViewAction("docx");
-    console.log(m)
 
     const wopi2 = new WopiActions();
-    const m2 = await wopi2.getViewAction("xlsx");
-    console.log(m2)
+    const edit_action = await wopi2.getEditAction("xlsx");
+    const edit_action_url = edit_action.getActionURL({
+        file_identifier: "1234",
+        options :{
+            is_business_user: true,
+            language: "ar",
+        }
+    })
+    console.log("Edit action URL: ", edit_action_url);
+
 })()
